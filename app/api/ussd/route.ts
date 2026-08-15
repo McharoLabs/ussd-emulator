@@ -11,6 +11,27 @@ const parser = new XMLParser({
   trimValues: true,
 })
 
+interface ParsedUssdMessage {
+  data?: string
+}
+
+interface ParsedUssd {
+  type?: string | number
+  msg?: string | ParsedUssdMessage
+}
+
+interface ParsedUssdXml {
+  ussd?: ParsedUssd
+}
+
+interface UssdRequestPayload {
+  sessionid?: string
+  type?: number
+  msg?: string
+  imsi?: string
+  msisdn?: string
+}
+
 function escapeXml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -36,35 +57,77 @@ function buildRequestXml(opts: {
 </ussd>`
 }
 
-function parseResponseXml(xml: string): { type: string | null; msg: string } {
+/**
+ * Parses both supported USSD response formats:
+ *
+ * Format 1:
+ * <msg>Hello</msg>
+ *
+ * Format 2:
+ * <msg>
+ *   <data>Hello</data>
+ * </msg>
+ */
+function parseResponseXml(xml: string): {
+  type: string | null
+  msg: string
+} {
   try {
-    const obj = parser.parse(xml)
-    const ussd = obj?.ussd ?? {}
-    const type = ussd.type !== undefined && ussd.type !== null ? String(ussd.type) : null
-    const msg = ussd.msg !== undefined && ussd.msg !== null ? String(ussd.msg) : ""
-    return { type, msg }
+    const obj = parser.parse(xml) as ParsedUssdXml
+    const ussd = obj.ussd
+
+    const type =
+      ussd?.type !== undefined && ussd.type !== null
+        ? String(ussd.type)
+        : null
+
+    let msg = ""
+
+    if (typeof ussd?.msg === "string") {
+      // <msg>Hello</msg>
+      msg = ussd.msg
+    } else if (
+      ussd?.msg &&
+      typeof ussd.msg === "object" &&
+      typeof ussd.msg.data === "string"
+    ) {
+      // <msg><data>Hello</data></msg>
+      msg = ussd.msg.data
+    }
+
+    return {
+      type,
+      msg,
+    }
   } catch {
-    return { type: null, msg: "" }
+    return {
+      type: null,
+      msg: "",
+    }
   }
 }
 
 export async function POST(request: Request) {
-  const endpoint = process.env.USSD_ENDPOINT || "http://localhost:3000/ussd/vodacom/process"
+  const endpoint =
+    process.env.USSD_ENDPOINT ||
+    "http://localhost:3000/ussd/vodacom/process"
+
   const defaultImsi = process.env.USSD_IMSI || "123123123"
   const defaultMsisdn = process.env.USSD_MSISDN || "255714585855"
 
-  let payload: {
-    sessionid?: string
-    type?: number
-    msg?: string
-    imsi?: string
-    msisdn?: string
-  }
+  let payload: UssdRequestPayload
 
   try {
-    payload = await request.json()
+    payload = (await request.json()) as UssdRequestPayload
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 })
+    return NextResponse.json(
+      {
+        error: "Invalid JSON body",
+      },
+      {
+        status: 400,
+      },
+    )
   }
 
   const sessionid = payload.sessionid ?? ""
@@ -73,22 +136,41 @@ export async function POST(request: Request) {
   const imsi = payload.imsi || defaultImsi
   const msisdn = payload.msisdn || defaultMsisdn
 
-  const requestXml = buildRequestXml({ sessionid, imsi, type, msisdn, msg })
+  const requestXml = buildRequestXml({
+    sessionid,
+    imsi,
+    type,
+    msisdn,
+    msg,
+  })
 
   const startedAt = Date.now()
 
   try {
     const res = await axios.post(endpoint, requestXml, {
-      headers: { "Content-Type": "application/xml" },
+      headers: {
+        "Content-Type": "application/xml",
+        Authorization: `Bearer ${process.env.USSD_AUTH_TOKEN ?? ""}`,
+      },
       responseType: "text",
-      // don't throw on non-2xx so we can surface it in the debug panel
+
+      // Don't throw on non-2xx responses.
+      // We want to expose the response in the debug panel.
       validateStatus: () => true,
-      timeout: 15000,
-      transformResponse: [(d) => d],
+
+      timeout: 15_000,
+
+      // Prevent Axios from trying to parse the XML.
+      transformResponse: [(data: unknown) => data],
     })
 
     const durationMs = Date.now() - startedAt
-    const responseXml = typeof res.data === "string" ? res.data : String(res.data ?? "")
+
+    const responseXml =
+      typeof res.data === "string"
+        ? res.data
+        : String(res.data ?? "")
+
     const parsed = parseResponseXml(responseXml)
 
     const body: UssdApiResponse = {
@@ -101,16 +183,19 @@ export async function POST(request: Request) {
       responseXml,
       parsed,
     }
+
     return NextResponse.json(body)
   } catch (err) {
     const durationMs = Date.now() - startedAt
     const axiosErr = err as AxiosError
+
     const message =
       axiosErr.code === "ECONNABORTED"
         ? "Request timed out while contacting the USSD gateway."
         : axiosErr.code === "ECONNREFUSED"
           ? `Connection refused. Is the USSD gateway running at ${endpoint}?`
-          : axiosErr.message || "Unknown error contacting the USSD gateway."
+          : axiosErr.message ||
+            "Unknown error contacting the USSD gateway."
 
     const body: UssdApiResponse = {
       ok: false,
@@ -120,12 +205,18 @@ export async function POST(request: Request) {
       endpoint,
       requestXml,
       responseXml: "",
-      parsed: { type: null, msg: "" },
+      parsed: {
+        type: null,
+        msg: "",
+      },
       error: message,
     }
-    return NextResponse.json(body, { status: 200 })
+
+    return NextResponse.json(body, {
+      status: 200,
+    })
   }
 }
 
-// expose the continue sentinel so the client and server agree
+// Expose the continue sentinel so the client and server agree.
 export const CONTINUE = USSD_CONTINUE
